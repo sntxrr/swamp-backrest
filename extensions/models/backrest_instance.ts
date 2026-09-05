@@ -62,8 +62,8 @@ const GlobalArgsSchema = z.object({
   apiUrl: z.string().url().describe(
     "Base URL of the Backrest API, e.g. http://backrest.internal:9898. No trailing slash needed. Prefer an address reachable directly; a URL fronted by an SSO proxy answers with an HTML login page rather than JSON.",
   ),
-  apiKey: z.string().optional().describe(
-    "Bearer token, when the instance has authentication enabled. Omit for an instance with auth disabled. Supply it from a vault rather than inline.",
+  apiKey: z.string().optional().meta({ sensitive: true }).describe(
+    "Bearer token, when the instance has authentication enabled. Omit for an instance with auth disabled. Supply it from a vault rather than inline — marking it sensitive keeps it out of logs, but the stored model config still holds whatever literal you pass.",
   ),
   requestTimeoutSeconds: z.number().int().positive().max(300).default(30)
     .describe(
@@ -208,7 +208,7 @@ async function call(
 }
 
 /** Repository ids Backrest is configured with, minus any excluded. */
-export async function listRepos(globalArgs: GlobalArgs): Promise<string[]> {
+async function listRepos(globalArgs: GlobalArgs): Promise<string[]> {
   const config = await call(globalArgs, "GetConfig", {}) as {
     repos?: ConfigRepo[];
   };
