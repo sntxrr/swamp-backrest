@@ -1,0 +1,238 @@
+import { assertEquals, assertThrows } from "jsr:@std/assert@1";
+import {
+  assess,
+  endpoint,
+  groupSnapshots,
+  summarise,
+} from "./backrest_instance.ts";
+
+const HOUR = 3_600_000;
+const NOW = Date.parse("2026-09-05T12:00:00.000Z");
+
+function op(repoId: string, iso: string, asNumber = false) {
+  const ms = Date.parse(iso);
+  return {
+    repoId,
+    operationIndexSnapshot: {
+      snapshot: { unixTimeMs: asNumber ? ms : String(ms) },
+    },
+  };
+}
+
+Deno.test("endpoint joins without doubling the slash", () => {
+  assertEquals(
+    endpoint("http://host:9898", "GetConfig"),
+    "http://host:9898/v1.Backrest/GetConfig",
+  );
+  assertEquals(
+    endpoint("http://host:9898/", "GetConfig"),
+    "http://host:9898/v1.Backrest/GetConfig",
+  );
+  assertEquals(
+    endpoint("http://host:9898///", "DoRepoTask"),
+    "http://host:9898/v1.Backrest/DoRepoTask",
+  );
+});
+
+Deno.test("groupSnapshots keys on each operation's own repoId", () => {
+  // The whole point: the server hands back the entire log regardless of the
+  // selector, so grouping must come from the operations themselves.
+  const grouped = groupSnapshots([
+    op("heron", "2026-09-05T04:00:00Z"),
+    op("heron", "2026-09-04T04:00:00Z"),
+    op("mallard", "2026-09-05T07:00:00Z"),
+  ]);
+
+  assertEquals(grouped.size, 2);
+  assertEquals(grouped.get("heron")?.count, 2);
+  assertEquals(
+    grouped.get("heron")?.latestMs,
+    Date.parse("2026-09-05T04:00:00Z"),
+  );
+  assertEquals(grouped.get("mallard")?.count, 1);
+});
+
+Deno.test("groupSnapshots keeps the newest regardless of arrival order", () => {
+  const grouped = groupSnapshots([
+    op("heron", "2026-09-01T04:00:00Z"),
+    op("heron", "2026-09-05T04:00:00Z"),
+    op("heron", "2026-09-03T04:00:00Z"),
+  ]);
+  assertEquals(
+    grouped.get("heron")?.latestMs,
+    Date.parse("2026-09-05T04:00:00Z"),
+  );
+});
+
+Deno.test("groupSnapshots accepts numeric as well as string timestamps", () => {
+  const grouped = groupSnapshots([op("heron", "2026-09-05T04:00:00Z", true)]);
+  assertEquals(
+    grouped.get("heron")?.latestMs,
+    Date.parse("2026-09-05T04:00:00Z"),
+  );
+});
+
+Deno.test("groupSnapshots ignores non-snapshot operations", () => {
+  const grouped = groupSnapshots([
+    { repoId: "heron", operationBackup: { status: "STATUS_SUCCESS" } } as never,
+    op("heron", "2026-09-05T04:00:00Z"),
+  ]);
+  assertEquals(grouped.get("heron")?.count, 1);
+});
+
+Deno.test("groupSnapshots discards unusable rows rather than counting them", () => {
+  const grouped = groupSnapshots([
+    { operationIndexSnapshot: { snapshot: { unixTimeMs: "1" } } } as never,
+    { repoId: "", operationIndexSnapshot: { snapshot: { unixTimeMs: "1" } } },
+    { repoId: "heron", operationIndexSnapshot: { snapshot: {} } },
+    { repoId: "heron", operationIndexSnapshot: {} },
+    {
+      repoId: "heron",
+      operationIndexSnapshot: { snapshot: { unixTimeMs: "not-a-number" } },
+    },
+    { repoId: "heron", operationIndexSnapshot: { snapshot: { unixTimeMs: 0 } } },
+    {
+      repoId: "heron",
+      operationIndexSnapshot: { snapshot: { unixTimeMs: -5 } },
+    },
+  ]);
+  // A zero or negative epoch would otherwise read as 1970 and look catastrophic.
+  assertEquals(grouped.size, 0);
+});
+
+Deno.test("assess separates never-read from stopped-advancing", () => {
+  const observed = groupSnapshots([
+    op("heron", "2026-09-05T04:00:00Z"), // 8h old  -> ok
+    op("mallard", "2026-08-30T04:00:00Z"), // 152h old -> stale
+  ]);
+
+  const statuses = assess(
+    ["heron", "mallard", "kestrel"],
+    observed,
+    new Map(),
+    NOW,
+    48,
+  );
+
+  assertEquals(statuses.map((s) => s.status), ["ok", "stale", "unindexed"]);
+  assertEquals(statuses[0].ageHours, 8);
+  assertEquals(statuses[2].snapshotCount, 0);
+  assertEquals(statuses[2].latestSnapshotAt, null);
+  assertEquals(statuses[2].ageHours, null);
+});
+
+Deno.test("assess treats the freshness limit as exclusive at the boundary", () => {
+  const observed = groupSnapshots([
+    op("heron", new Date(NOW - 48 * HOUR).toISOString()),
+  ]);
+  assertEquals(assess(["heron"], observed, new Map(), NOW, 48)[0].status, "ok");
+
+  const older = groupSnapshots([
+    op("heron", new Date(NOW - 48 * HOUR - 60_000).toISOString()),
+  ]);
+  assertEquals(
+    assess(["heron"], older, new Map(), NOW, 48)[0].status,
+    "stale",
+  );
+});
+
+Deno.test("assess reports movement only when the newest snapshot advanced", () => {
+  const observed = groupSnapshots([op("heron", "2026-09-05T04:00:00Z")]);
+
+  // Unchanged since the baseline: re-indexing an idle repository is a no-op,
+  // which must not be mistaken for fresh activity.
+  const unchanged = assess(
+    ["heron"],
+    observed,
+    new Map([["heron", Date.parse("2026-09-05T04:00:00Z")]]),
+    NOW,
+    48,
+  );
+  assertEquals(unchanged[0].movedThisRun, false);
+
+  const advanced = assess(
+    ["heron"],
+    observed,
+    new Map([["heron", Date.parse("2026-09-04T04:00:00Z")]]),
+    NOW,
+    48,
+  );
+  assertEquals(advanced[0].movedThisRun, true);
+
+  // Absent from the baseline entirely means it appeared during this run.
+  const appeared = assess(["heron"], observed, new Map(), NOW, 48);
+  assertEquals(appeared[0].movedThisRun, true);
+});
+
+Deno.test("summarise counts each failure class separately", () => {
+  const statuses = assess(
+    ["heron", "mallard", "kestrel", "godwit"],
+    groupSnapshots([
+      op("heron", "2026-09-05T04:00:00Z"),
+      op("mallard", "2026-09-05T05:00:00Z"),
+      op("kestrel", "2026-08-01T04:00:00Z"),
+    ]),
+    new Map(),
+    NOW,
+    48,
+  );
+
+  const fleet = summarise("http://host:9898", 48, statuses, true, 42, false);
+
+  assertEquals(fleet.total, 4);
+  assertEquals(fleet.ok, 2);
+  assertEquals(fleet.stale, 1);
+  assertEquals(fleet.unindexed, 1);
+  assertEquals(fleet.problemRepos, ["godwit", "kestrel"]);
+  assertEquals(fleet.reindexed, true);
+  assertEquals(fleet.waitedSeconds, 42);
+  assertEquals(fleet.allObserved, false);
+  assertEquals(fleet.maxSnapshotAgeHours, 48);
+});
+
+Deno.test("summarise on a wholly healthy fleet reports no problems", () => {
+  const statuses = assess(
+    ["heron", "mallard"],
+    groupSnapshots([
+      op("heron", "2026-09-05T04:00:00Z"),
+      op("mallard", "2026-09-05T05:00:00Z"),
+    ]),
+    new Map(),
+    NOW,
+    48,
+  );
+  const fleet = summarise("http://host:9898", 48, statuses, true, 12, true);
+
+  assertEquals(fleet.ok, 2);
+  assertEquals(fleet.problemRepos, []);
+  assertEquals(fleet.allObserved, true);
+});
+
+Deno.test("an empty fleet does not read as a healthy fleet", () => {
+  // Guards the assert-the-positive trap: ok===stale===0 must not be mistaken
+  // for success by a consumer, so total is what a caller has to check.
+  const fleet = summarise("http://host:9898", 48, [], false, 0, true);
+  assertEquals(fleet.total, 0);
+  assertEquals(fleet.ok, 0);
+  assertEquals(fleet.problemRepos, []);
+});
+
+Deno.test("assess preserves the order it was asked for", () => {
+  const observed = groupSnapshots([op("mallard", "2026-09-05T04:00:00Z")]);
+  const statuses = assess(
+    ["kestrel", "mallard", "heron"],
+    observed,
+    new Map(),
+    NOW,
+    48,
+  );
+  assertEquals(statuses.map((s) => s.repoId), ["kestrel", "mallard", "heron"]);
+});
+
+Deno.test("endpoint rejects nothing it is given — callers pass fixed names", () => {
+  // Documents that method names are internal constants, never user input.
+  assertThrows(() => {
+    // deno-lint-ignore no-explicit-any
+    (endpoint as any)(undefined, "GetConfig");
+  });
+});
