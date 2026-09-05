@@ -3,6 +3,7 @@ import {
   assess,
   endpoint,
   groupSnapshots,
+  isSettled,
   summarise,
 } from "./backrest_instance.ts";
 
@@ -235,4 +236,40 @@ Deno.test("endpoint rejects nothing it is given — callers pass fixed names", (
     // deno-lint-ignore no-explicit-any
     (endpoint as any)(undefined, "GetConfig");
   });
+});
+
+Deno.test("isSettled requires BOTH all-seen and nothing-advancing", () => {
+  const a = groupSnapshots([op("heron", "2026-09-05T04:00:00Z")]);
+  const b = groupSnapshots([op("heron", "2026-09-05T05:00:00Z")]);
+
+  // Advanced since the previous poll -> not settled, even though all are seen.
+  const moving = isSettled(["heron"], a, b);
+  assertEquals(moving.allObserved, true);
+  assertEquals(moving.advanced, true);
+  assertEquals(moving.settled, false);
+
+  // Same picture twice -> settled.
+  const still = isSettled(["heron"], b, b);
+  assertEquals(still.advanced, false);
+  assertEquals(still.settled, true);
+});
+
+Deno.test("isSettled is false while any repository is still unseen", () => {
+  const seen = groupSnapshots([op("heron", "2026-09-05T04:00:00Z")]);
+  const state = isSettled(["heron", "mallard"], seen, seen);
+  assertEquals(state.allObserved, false);
+  assertEquals(state.settled, false);
+});
+
+Deno.test("isSettled counts a repository appearing for the first time as movement", () => {
+  // Guards the regression this function exists for: on a healthy fleet every
+  // repository is already present, so presence alone would declare victory
+  // before the freshly triggered index tasks had landed, and the run would
+  // report the state from BEFORE its own trigger.
+  const before = groupSnapshots([]);
+  const after = groupSnapshots([op("heron", "2026-09-05T04:00:00Z")]);
+  const state = isSettled(["heron"], before, after);
+  assertEquals(state.allObserved, true);
+  assertEquals(state.advanced, true);
+  assertEquals(state.settled, false);
 });

@@ -281,6 +281,34 @@ async function readSnapshots(globalArgs: GlobalArgs): Promise<Observed> {
  * ------------------------------------------------------------------ */
 
 /**
+ * Decide whether the picture has stopped changing between two polls.
+ *
+ * Settled means both halves: every requested repository has been seen at least
+ * once, AND none of them gained a newer snapshot since the previous poll. The
+ * second half is what stops a healthy fleet — where every repository already
+ * has snapshots — from being declared settled before the tasks just triggered
+ * have landed, which would report the state from before the trigger.
+ *
+ * @param requested Repositories this run asked to index.
+ * @param previous Newest snapshot per repository at the previous poll.
+ * @param observed Newest snapshot per repository at this poll.
+ * @returns Whether all were seen, whether any advanced, and the conjunction.
+ */
+export function isSettled(
+  requested: string[],
+  previous: Observed,
+  observed: Observed,
+): { allObserved: boolean; advanced: boolean; settled: boolean } {
+  const allObserved = requested.every((repoId) => observed.has(repoId));
+  const advanced = requested.some((repoId) => {
+    const now = observed.get(repoId)?.latestMs;
+    const then = previous.get(repoId)?.latestMs;
+    return now !== undefined && (then === undefined || now > then);
+  });
+  return { allObserved, advanced, settled: allObserved && !advanced };
+}
+
+/**
  * Classify each requested repository against the freshness limit.
  *
  * A repository absent from `observed` is `unindexed` rather than merely old:
@@ -414,7 +442,18 @@ export const model = {
   type: "@sntxrr/backrest/instance",
   description:
     "Keep a Backrest server's snapshot index current for repositories it does not back up itself, and report how fresh each one is. Never writes to a restic repository.",
-  version: "2026.09.05.1",
+  version: "2026.09.05.2",
+  // No globalArguments changed meaning between 2026.09.05.1 and .2, so there is
+  // nothing to migrate — but the entry still has to exist, or instances stay
+  // pinned to the old typeVersion and never pick up the corrected wait.
+  upgrades: [
+    {
+      toVersion: "2026.09.05.2",
+      description:
+        "reindex now waits for the picture to stop changing rather than only for every repository to be present. On a healthy fleet every repository already has snapshots, so the old condition was satisfied immediately and the run reported the state from BEFORE its own trigger — a backup that had stopped running would not have been noticed until the following day. Nothing to migrate; runs simply take one or two poll intervals instead of returning instantly.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+  ],
   globalArguments: GlobalArgsSchema,
   resources: {
     fleet: {
@@ -499,21 +538,33 @@ export const model = {
           });
         }
 
-        // DoRepoTask enqueues and returns; it does not wait. Poll until every
-        // requested repository has been seen at least once. Re-indexing a
-        // repository whose backups have not moved produces no new operation,
-        // so "has any snapshot" is the only completion signal the API offers —
-        // and a repository Backrest cannot read never satisfies it, which is
-        // exactly the condition worth waiting to be sure about.
+        // DoRepoTask enqueues and returns; it does not wait, so the reading
+        // must not be taken before the tasks land. Poll until the picture stops
+        // changing: every requested repository seen at least once AND no
+        // repository's newest snapshot advanced since the previous poll.
+        //
+        // The "stops changing" half is load-bearing. Waiting only for presence
+        // would exit immediately on a healthy fleet, where every repository
+        // already has snapshots from previous runs — reporting the state from
+        // BEFORE the trigger, so a backup that stopped running would not be
+        // noticed until the following day. At least one poll always happens.
+        //
+        // A repository Backrest cannot read never becomes present, so it holds
+        // the loop to the deadline. That is the condition most worth being sure
+        // about, and the deadline is what bounds it.
         const startedAt = Date.now();
         const deadline = startedAt + globalArgs.settleTimeoutSeconds * 1000;
         let observed = before;
-        let allObserved = requested.every((repoId) => observed.has(repoId));
+        let allObserved = false;
 
-        while (!allObserved && Date.now() < deadline) {
+        while (Date.now() < deadline) {
           await sleep(globalArgs.pollIntervalSeconds * 1000);
+          const previous = observed;
           observed = await readSnapshots(globalArgs);
-          allObserved = requested.every((repoId) => observed.has(repoId));
+
+          const state = isSettled(requested, previous, observed);
+          allObserved = state.allObserved;
+          if (state.settled) break;
         }
 
         const waitedSeconds = Math.round((Date.now() - startedAt) / 1000);
