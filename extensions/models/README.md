@@ -81,23 +81,31 @@ week later. Every Backrest user is an administrator (there are no roles), so a
 separate user per caller is what lets you rotate or revoke one without the
 others.
 
+Basic sends the password on every request, merely base64-encoded. When a
+credential is configured and `apiUrl` is plain `http://` to anything but
+loopback, each run logs one warning saying so. Use https, or — when the traffic
+cannot leave the machine or a trusted segment, such as a container calling its
+own host's address — set `allowPlaintextCredentials: true` to record that and
+silence it.
+
 Point `apiUrl` at an address that serves the API directly. An instance behind an
 SSO proxy answers with an HTML login page, which the model reports as such
 rather than letting it parse as an empty fleet.
 
 ## Global arguments
 
-| Argument                | Default | Notes                                                     |
-| ----------------------- | ------- | --------------------------------------------------------- |
-| `apiUrl`                | —       | Required. Base URL, no trailing slash needed.             |
-| `apiKey`                | —       | Bearer token (a 7-day JWT). Prefer `username`.            |
-| `username`              | —       | HTTP Basic user. Set with `password`, not with `apiKey`.  |
-| `password`              | —       | Password for `username`, from a vault.                    |
-| `requestTimeoutSeconds` | `30`    | Per API call, not the settle wait.                        |
-| `settleTimeoutSeconds`  | `900`   | Budget for every repository to appear. See below.         |
-| `pollIntervalSeconds`   | `10`    | How often to re-read the operation log while waiting.     |
-| `maxSnapshotAgeHours`   | `48`    | Older than this is `stale`.                               |
-| `excludeRepos`          | `[]`    | Repository ids to leave alone.                            |
+| Argument                    | Default | Notes                                                     |
+| --------------------------- | ------- | --------------------------------------------------------- |
+| `apiUrl`                    | —       | Required. Base URL, no trailing slash needed.             |
+| `apiKey`                    | —       | Bearer token (a 7-day JWT). Prefer `username`.            |
+| `username`                  | —       | HTTP Basic user. Set with `password`, not with `apiKey`.  |
+| `password`                  | —       | Password for `username`, from a vault.                    |
+| `requestTimeoutSeconds`     | `30`    | Per API call, not the settle wait.                        |
+| `settleTimeoutSeconds`      | `900`   | Budget for every repository to appear. See below.         |
+| `pollIntervalSeconds`       | `10`    | How often to re-read the operation log while waiting.     |
+| `maxSnapshotAgeHours`       | `48`    | Older than this is `stale`.                               |
+| `excludeRepos`              | `[]`    | Repository ids to leave alone.                            |
+| `allowPlaintextCredentials` | `false` | Silence the http warning for a trusted path.              |
 
 `settleTimeoutSeconds` deserves a note. Backrest indexes serially, so one
 repository it cannot read holds up every repository queued behind it — measured
