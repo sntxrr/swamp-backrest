@@ -1,6 +1,7 @@
 import { assertEquals, assertThrows } from "jsr:@std/assert@1";
 import {
   assess,
+  authorization,
   endpoint,
   groupSnapshots,
   isSettled,
@@ -91,7 +92,10 @@ Deno.test("groupSnapshots discards unusable rows rather than counting them", () 
       repoId: "heron",
       operationIndexSnapshot: { snapshot: { unixTimeMs: "not-a-number" } },
     },
-    { repoId: "heron", operationIndexSnapshot: { snapshot: { unixTimeMs: 0 } } },
+    {
+      repoId: "heron",
+      operationIndexSnapshot: { snapshot: { unixTimeMs: 0 } },
+    },
     {
       repoId: "heron",
       operationIndexSnapshot: { snapshot: { unixTimeMs: -5 } },
@@ -272,4 +276,65 @@ Deno.test("isSettled counts a repository appearing for the first time as movemen
   assertEquals(state.allObserved, true);
   assertEquals(state.advanced, true);
   assertEquals(state.settled, false);
+});
+
+// Decode the way Go's r.BasicAuth() does: base64 → bytes → split on the FIRST
+// colon, so a password containing ':' survives.
+function decodeBasic(header: string): [string, string] {
+  const bytes = Uint8Array.from(
+    atob(header.replace(/^Basic /, "")),
+    (c) => c.charCodeAt(0),
+  );
+  const text = new TextDecoder().decode(bytes);
+  const i = text.indexOf(":");
+  return [text.slice(0, i), text.slice(i + 1)];
+}
+
+Deno.test("authorization sends nothing when no credential is configured", () => {
+  assertEquals(authorization({}), undefined);
+  assertEquals(authorization({ username: "", password: "" }), undefined);
+});
+
+Deno.test("authorization sends Basic for username and password", () => {
+  const header = authorization({ username: "automation", password: "s3cret" });
+  assertEquals(header, "Basic YXV0b21hdGlvbjpzM2NyZXQ=");
+});
+
+Deno.test("authorization round-trips colons and non-ASCII in the password", () => {
+  const password = "p:ä:ß✓";
+  const header = authorization({ username: "automation", password })!;
+  assertEquals(decodeBasic(header), ["automation", password]);
+});
+
+Deno.test("authorization keeps sending Bearer for apiKey", () => {
+  assertEquals(authorization({ apiKey: "jwt" }), "Bearer jwt");
+});
+
+Deno.test("authorization refuses half a Basic credential", () => {
+  assertThrows(
+    () => authorization({ username: "automation" }),
+    Error,
+    "password is empty",
+  );
+  assertThrows(
+    () => authorization({ password: "s3cret" }),
+    Error,
+    "username is empty",
+  );
+});
+
+Deno.test("authorization refuses Basic and apiKey together", () => {
+  assertThrows(
+    () => authorization({ apiKey: "jwt", username: "a", password: "b" }),
+    Error,
+    "not both",
+  );
+});
+
+Deno.test("authorization errors never echo the password", () => {
+  try {
+    authorization({ password: "do-not-print-me" });
+  } catch (e) {
+    assertEquals(String(e).includes("do-not-print-me"), false);
+  }
 });
