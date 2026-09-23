@@ -87,6 +87,9 @@ const GlobalArgsSchema = z.object({
   excludeRepos: z.array(z.string()).default([]).describe(
     "Repository ids to leave alone. Use for repositories Backrest backs up itself — it already indexes those on its own schedule — and for any it is known to be unable to read.",
   ),
+  allowPlaintextCredentials: z.boolean().default(false).describe(
+    "Silence the warning logged when a credential is sent to a non-loopback `http://` apiUrl. Set it only when that traffic cannot leave the machine or a trusted segment — for example a container calling its own host's address — since Basic sends the password, merely base64-encoded, on every request.",
+  ),
 });
 
 type GlobalArgs = z.infer<typeof GlobalArgsSchema>;
@@ -202,6 +205,40 @@ export function authorization(
   }
   if (creds.apiKey) return `Bearer ${creds.apiKey}`;
   return undefined;
+}
+
+/**
+ * The warning to log when a credential would cross the network in cleartext,
+ * or undefined when there is nothing to warn about.
+ *
+ * Basic sends the password on every request, only base64-encoded, and it
+ * stays valid until rotated — so over plain http anyone on the path can
+ * replay it. Loopback never leaves the machine and https is encrypted, so
+ * neither warns; nor does an instance with no credential. It warns rather
+ * than fails: an existing http deployment keeps working, and
+ * `allowPlaintextCredentials` records that its path is trusted.
+ */
+export function plaintextCredentialWarning(
+  args: Pick<
+    GlobalArgs,
+    "apiUrl" | "apiKey" | "username" | "password" | "allowPlaintextCredentials"
+  >,
+): string | undefined {
+  if (args.allowPlaintextCredentials) return undefined;
+  const scheme = authorization(args)?.split(" ")[0];
+  if (!scheme) return undefined;
+  let url: URL;
+  try {
+    url = new URL(args.apiUrl);
+  } catch {
+    return undefined; // the schema already requires a URL; nothing to add here
+  }
+  if (url.protocol !== "http:") return undefined;
+  const host = url.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  const loopback = host === "localhost" || host.endsWith(".localhost") ||
+    host === "::1" || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host);
+  if (loopback) return undefined;
+  return `Sending ${scheme} credentials to ${url.host} over plain http: anyone on the path can read and replay them. Use https, or set allowPlaintextCredentials if this traffic cannot leave the host or a trusted segment.`;
 }
 
 async function call(
@@ -495,11 +532,11 @@ export const model = {
   type: "@sntxrr/backrest/instance",
   description:
     "Keep a Backrest server's snapshot index current for repositories it does not back up itself, and report how fresh each one is. Never writes to a restic repository.",
-  version: "2026.09.23.1",
+  version: "2026.09.23.2",
   // No globalArguments changed meaning between 2026.09.05.1 and .2, so there is
   // nothing to migrate — but the entry still has to exist, or instances stay
   // pinned to the old typeVersion and never pick up the corrected wait.
-  // 2026.09.23.1 only adds optional arguments, so the same holds.
+  // 2026.09.23.1 and .2 only add optional arguments, so the same holds.
   upgrades: [
     {
       toVersion: "2026.09.05.2",
@@ -511,6 +548,12 @@ export const model = {
       toVersion: "2026.09.23.1",
       description:
         "Adds optional `username` and `password` for an instance with authentication enabled, sent as HTTP Basic, which Backrest checks on every request. `apiKey` is unchanged, but a Backrest JWT expires after seven days, which makes it a poor fit for a scheduled caller. Nothing to migrate: an instance that sets neither behaves exactly as before.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.09.23.2",
+      description:
+        "Warns once per run when a credential is sent to a non-loopback `http://` apiUrl, where Basic exposes the password to anyone on the path. Adds `allowPlaintextCredentials` (default false) to acknowledge a trusted path and silence it. Behaviour is otherwise unchanged; an existing http instance with credentials starts logging one warning per run until it sets the flag or moves to https.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
@@ -531,6 +574,8 @@ export const model = {
       arguments: z.object({}),
       execute: async (_args: Record<never, never>, context: Context) => {
         const { globalArgs, logger } = context;
+        const plaintext = plaintextCredentialWarning(globalArgs);
+        if (plaintext) logger.warn("{warning}", { warning: plaintext });
 
         const repoIds = await listRepos(globalArgs);
         const observed = await readSnapshots(globalArgs);
@@ -567,6 +612,8 @@ export const model = {
       }),
       execute: async (args: { repos: string[] }, context: Context) => {
         const { globalArgs, logger } = context;
+        const plaintext = plaintextCredentialWarning(globalArgs);
+        if (plaintext) logger.warn("{warning}", { warning: plaintext });
 
         const configured = await listRepos(globalArgs);
         const requested = args.repos.length > 0 ? args.repos : configured;

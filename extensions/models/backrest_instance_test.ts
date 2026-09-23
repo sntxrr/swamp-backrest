@@ -5,6 +5,7 @@ import {
   endpoint,
   groupSnapshots,
   isSettled,
+  plaintextCredentialWarning,
   summarise,
 } from "./backrest_instance.ts";
 
@@ -337,4 +338,106 @@ Deno.test("authorization errors never echo the password", () => {
   } catch (e) {
     assertEquals(String(e).includes("do-not-print-me"), false);
   }
+});
+
+const BASIC = { username: "automation", password: "s3cret" };
+
+Deno.test("plaintext warning fires for credentials over http to another host", () => {
+  const w = plaintextCredentialWarning({
+    apiUrl: "http://backrest.internal:9898",
+    ...BASIC,
+    allowPlaintextCredentials: false,
+  });
+  assertEquals(typeof w, "string");
+  assertEquals(
+    w!.includes("Basic credentials to backrest.internal:9898"),
+    true,
+  );
+  assertEquals(w!.includes("s3cret"), false);
+  assertEquals(w!.includes("automation"), false);
+});
+
+Deno.test("plaintext warning names Bearer for apiKey", () => {
+  const w = plaintextCredentialWarning({
+    apiUrl: "http://10.0.0.5:9898",
+    apiKey: "jwt",
+    allowPlaintextCredentials: false,
+  });
+  assertEquals(w!.includes("Bearer credentials"), true);
+  assertEquals(w!.includes("jwt"), false);
+});
+
+Deno.test("plaintext warning is silent for https", () => {
+  assertEquals(
+    plaintextCredentialWarning({
+      apiUrl: "https://backrest.internal",
+      ...BASIC,
+      allowPlaintextCredentials: false,
+    }),
+    undefined,
+  );
+});
+
+Deno.test("plaintext warning is silent for every loopback form", () => {
+  for (
+    const apiUrl of [
+      "http://localhost:9898",
+      "http://LOCALHOST:9898",
+      "http://backrest.localhost:9898",
+      "http://127.0.0.1:9898",
+      "http://127.8.9.10:9898",
+      "http://[::1]:9898",
+    ]
+  ) {
+    assertEquals(
+      plaintextCredentialWarning({
+        apiUrl,
+        ...BASIC,
+        allowPlaintextCredentials: false,
+      }),
+      undefined,
+      apiUrl,
+    );
+  }
+});
+
+Deno.test("plaintext warning does not mistake look-alike hosts for loopback", () => {
+  for (
+    const apiUrl of [
+      "http://127.0.0.1.example.com:9898",
+      "http://localhost.example.com:9898",
+      "http://[::2]:9898",
+    ]
+  ) {
+    assertEquals(
+      typeof plaintextCredentialWarning({
+        apiUrl,
+        ...BASIC,
+        allowPlaintextCredentials: false,
+      }),
+      "string",
+      apiUrl,
+    );
+  }
+});
+
+Deno.test("plaintext warning is silent without a credential", () => {
+  assertEquals(
+    plaintextCredentialWarning({
+      apiUrl: "http://backrest.internal:9898",
+      allowPlaintextCredentials: false,
+    }),
+    undefined,
+  );
+});
+
+Deno.test("allowPlaintextCredentials silences the warning", () => {
+  assertEquals(
+    plaintextCredentialWarning({
+      apiUrl: "http://backrest.internal:9898",
+      ...BASIC,
+      allowPlaintextCredentials: true,
+    }),
+    undefined,
+  );
 });
