@@ -63,7 +63,13 @@ const GlobalArgsSchema = z.object({
     "Base URL of the Backrest API, e.g. http://backrest.internal:9898. No trailing slash needed. Prefer an address reachable directly; a URL fronted by an SSO proxy answers with an HTML login page rather than JSON.",
   ),
   apiKey: z.string().optional().meta({ sensitive: true }).describe(
-    "Bearer token, when the instance has authentication enabled. Omit for an instance with auth disabled. Supply it from a vault rather than inline — marking it sensitive keeps it out of logs, but the stored model config still holds whatever literal you pass.",
+    "Bearer token, when the instance has authentication enabled. Backrest issues only JWTs from its Login call, which expire after seven days, so for anything scheduled prefer `username` and `password`. Omit for an instance with auth disabled. Supply it from a vault rather than inline — marking it sensitive keeps it out of logs, but the stored model config still holds whatever literal you pass.",
+  ),
+  username: z.string().optional().describe(
+    "Backrest user to authenticate as with HTTP Basic, which Backrest checks on every request — no login call and no token to expire. Set together with `password`; mutually exclusive with `apiKey`. Give each automated caller its own user so it can be rotated and revoked on its own.",
+  ),
+  password: z.string().optional().meta({ sensitive: true }).describe(
+    "Password for `username`. Supply it from a vault rather than inline, for the same reason as `apiKey`.",
   ),
   requestTimeoutSeconds: z.number().int().positive().max(300).default(30)
     .describe(
@@ -157,6 +163,47 @@ export function endpoint(apiUrl: string, method: string): string {
   return `${apiUrl.replace(/\/+$/, "")}/v1.Backrest/${method}`;
 }
 
+/**
+ * The Authorization header value for the configured credential, or undefined
+ * for an instance with auth disabled.
+ *
+ * Backrest's middleware tries HTTP Basic first on every request, then falls
+ * back to a Bearer JWT. Only one header can be sent, so configuring both is
+ * refused rather than silently preferring one — as is a username without a
+ * password or the reverse, which would otherwise reach the server as an
+ * anonymous call and fail with a 401 that names neither mistake.
+ */
+export function authorization(
+  creds: Pick<GlobalArgs, "apiKey" | "username" | "password">,
+): string | undefined {
+  const hasUser = creds.username !== undefined && creds.username !== "";
+  const hasPassword = creds.password !== undefined && creds.password !== "";
+  if (hasUser !== hasPassword) {
+    throw new Error(
+      `Backrest credentials are incomplete: ${
+        hasUser
+          ? "username is set but password is empty"
+          : "password is set but username is empty"
+      }. Set both, or neither.`,
+    );
+  }
+  if (hasUser && creds.apiKey) {
+    throw new Error(
+      "Backrest credentials conflict: set either username and password, or apiKey — not both.",
+    );
+  }
+  if (hasUser) {
+    // btoa takes Latin-1 only; encode as UTF-8 first so a non-ASCII password
+    // is sent the way Go's r.BasicAuth() decodes it.
+    const bytes = new TextEncoder().encode(
+      `${creds.username}:${creds.password}`,
+    );
+    return `Basic ${btoa(String.fromCharCode(...bytes))}`;
+  }
+  if (creds.apiKey) return `Bearer ${creds.apiKey}`;
+  return undefined;
+}
+
 async function call(
   globalArgs: GlobalArgs,
   method: string,
@@ -165,9 +212,8 @@ async function call(
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
   };
-  if (globalArgs.apiKey) {
-    headers["Authorization"] = `Bearer ${globalArgs.apiKey}`;
-  }
+  const auth = authorization(globalArgs);
+  if (auth) headers["Authorization"] = auth;
 
   let response: Response;
   try {
@@ -187,8 +233,15 @@ async function call(
   const text = await response.text();
 
   if (!response.ok) {
+    // A 401 is the one status whose cause is always on this side, so say
+    // which credential (if any) was sent — never the credential itself.
+    const hint = response.status === 401
+      ? auth
+        ? ` (sent ${auth.split(" ")[0]} credentials; the server rejected them)`
+        : " (no credentials sent; the server has authentication enabled — set username and password)"
+      : "";
     throw new Error(
-      `Backrest ${method} returned HTTP ${response.status}: ${
+      `Backrest ${method} returned HTTP ${response.status}${hint}: ${
         text.slice(0, 300)
       }`,
     );
@@ -442,15 +495,22 @@ export const model = {
   type: "@sntxrr/backrest/instance",
   description:
     "Keep a Backrest server's snapshot index current for repositories it does not back up itself, and report how fresh each one is. Never writes to a restic repository.",
-  version: "2026.09.05.2",
+  version: "2026.09.23.1",
   // No globalArguments changed meaning between 2026.09.05.1 and .2, so there is
   // nothing to migrate — but the entry still has to exist, or instances stay
   // pinned to the old typeVersion and never pick up the corrected wait.
+  // 2026.09.23.1 only adds optional arguments, so the same holds.
   upgrades: [
     {
       toVersion: "2026.09.05.2",
       description:
         "reindex now waits for the picture to stop changing rather than only for every repository to be present. On a healthy fleet every repository already has snapshots, so the old condition was satisfied immediately and the run reported the state from BEFORE its own trigger — a backup that had stopped running would not have been noticed until the following day. Nothing to migrate; runs simply take one or two poll intervals instead of returning instantly.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.09.23.1",
+      description:
+        "Adds optional `username` and `password` for an instance with authentication enabled, sent as HTTP Basic, which Backrest checks on every request. `apiKey` is unchanged, but a Backrest JWT expires after seven days, which makes it a poor fit for a scheduled caller. Nothing to migrate: an instance that sets neither behaves exactly as before.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],

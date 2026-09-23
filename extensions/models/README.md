@@ -63,13 +63,23 @@ swamp model create @sntxrr/backrest/instance backrest \
 swamp model @sntxrr/backrest/instance method run reindex backrest
 ```
 
-With an authenticated instance, pass the token from a vault rather than inline:
+With an authenticated instance, give the model its own Backrest user and pass
+the password from a vault rather than inline:
 
 ```bash
 swamp model create @sntxrr/backrest/instance backrest \
   --global-arg apiUrl=http://backrest.internal:9898 \
-  --global-arg 'apiKey=${{ vault.get("backrest", "API_TOKEN") }}'
+  --global-arg username=automation \
+  --global-arg 'password=${{ vault.get("backrest", "AUTOMATION_PASSWORD") }}'
 ```
+
+The credential is sent as HTTP Basic, which Backrest checks on every request, so
+there is no login call and no token to expire. `apiKey` still works — it is sent
+as a Bearer token — but the only tokens Backrest issues are the JWTs from its
+`Login` call, which expire after seven days: a schedule built on one fails a
+week later. Every Backrest user is an administrator (there are no roles), so a
+separate user per caller is what lets you rotate or revoke one without the
+others.
 
 Point `apiUrl` at an address that serves the API directly. An instance behind an
 SSO proxy answers with an HTML login page, which the model reports as such
@@ -80,7 +90,9 @@ rather than letting it parse as an empty fleet.
 | Argument                | Default | Notes                                                     |
 | ----------------------- | ------- | --------------------------------------------------------- |
 | `apiUrl`                | —       | Required. Base URL, no trailing slash needed.             |
-| `apiKey`                | —       | Bearer token. Omit when auth is disabled.                 |
+| `apiKey`                | —       | Bearer token (a 7-day JWT). Prefer `username`.            |
+| `username`              | —       | HTTP Basic user. Set with `password`, not with `apiKey`.  |
+| `password`              | —       | Password for `username`, from a vault.                    |
 | `requestTimeoutSeconds` | `30`    | Per API call, not the settle wait.                        |
 | `settleTimeoutSeconds`  | `900`   | Budget for every repository to appear. See below.         |
 | `pollIntervalSeconds`   | `10`    | How often to re-read the operation log while waiting.     |
